@@ -1,0 +1,534 @@
+# -- coding: utf-8 --
+import gate_api
+from gate_api.exceptions import ApiException, GateApiException
+import pandas as pd
+import numpy as np
+import time
+import sys
+import logging
+from datetime import datetime
+from twilio.rest import Client
+import joblib
+import pandas_ta as ta
+import os
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from sklearn.preprocessing import MinMaxScaler
+import csv
+
+# --- Configuración de logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("tensorflow").setLevel(logging.ERROR)
+
+# ======================================================================
+# 1) PARÁMETROS DE USUARIO
+# ======================================================================
+# 🚨 ADVERTENCIA: Claves expuestas.
+API_KEY = "91164d7defcdbd2e0e7eb130c31abf33"
+API_SECRET = "06607d6cea3d69efae6e80e22d4af397ba4f12e9f70d1bd2dd3c5a815eecf19f"
+
+# --- Parámetros del Contrato ---
+SYMBOL = "BTC_USDT"
+SETTLE = "usdt"
+TIMEFRAME = "1m"
+LEVERAGE = "10"
+
+# --- Parámetros de Estrategia (ACTUALIZADO) ---
+RSI_PERIOD = 14
+RSI_BUY_LEVEL = 30
+RSI_SELL_LEVEL = 70
+RSI_EXIT_TARGET = 50
+VOL_PERIOD = 12
+VOL_LOW_MAX = 1.1
+VOL_HIGH_MAX = 1.13
+ATR_SL_MULTIPLIER = 2.5 # <--- MODIFICADO: Stop Loss fijo basado en ATR a 2.5
+TRAILING_SL_START_PERCENT = 0.005 # NUEVO: 0.5% de ganancia para activar Trailing Stop
+
+# --- Parámetros LSTM ---
+N_LAGS = 60
+MODEL_FILE = 'lstm_model_btc_1m.h5'
+SCALER_FILE = 'scaler_btc_1m.pkl'
+BASE_QTY = 0.010
+MODIFIER_HIGH_CONFIDENCE = 1.5
+MODIFIER_LOW_CONFIDENCE = 0.5
+LSTM_CONFIRMATION_THRESHOLD = 0.0005
+
+# --- Entrenamiento ---
+TRAIN_DATA_LIMIT = 2000
+TRAIN_EPOCHS = 20
+TRAIN_BATCH_SIZE = 32
+
+# --- Logs ---
+LOG_TRADES_FILE = 'trade_history_btc_1m.csv'
+LOG_PREDICTIONS_FILE = 'model_predictions_btc_1m.csv'
+
+# --- Twilio ---
+account_sid = 'AC64954a2119e4de5caf95aba1cef9ce47'
+auth_token = 'f1a5fd55ae0777ff9213ac26f2cf3c50'
+twilio_client = Client(account_sid, auth_token)
+whatsapp_from = 'whatsapp:+14155238886'
+whatsapp_to = 'whatsapp:+5218121487240'
+
+# ======================================================================
+# 2) FUNCIONES AUXILIARES
+# ======================================================================
+def setup_log_files():
+    if not os.path.exists(LOG_PREDICTIONS_FILE):
+        with open(LOG_PREDICTIONS_FILE, mode='w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["Timestamp", "Precio_Cierre", "Prediccion_LSTM", "RSI", "ATR"])
+    if not os.path.exists(LOG_TRADES_FILE):
+        with open(LOG_TRADES_FILE, mode='w', newline='') as f:
+            writer = csv.writer(f)
+            # Columna 'SL_Inicial' ahora almacena el nivel de precio del SL inicial/final
+            writer.writerow(["Timestamp_Cierre", "Tipo", "Precio_Entrada", "RSI_Entrada", "ATR_Entrada", "SL_Inicial", "Precio_Salida", "Motivo_Cierre", "PNL_Puntos"])
+
+def log_prediction(timestamp, price, prediction, rsi, atr):
+    try:
+        with open(LOG_PREDICTIONS_FILE, mode='a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([timestamp, f"{price:.4f}", f"{prediction:.4f}", f"{rsi:.2f}", f"{atr:.4f}"])
+    except Exception as e:
+        logging.error(f"Error log predicciones: {e}")
+
+def log_trade(timestamp, trade_type, entry_price, entry_rsi, entry_atr, initial_sl, exit_price, reason, pnl):
+    try:
+        with open(LOG_TRADES_FILE, mode='a', newline='') as f:
+            writer = csv.writer(f)
+            # La columna SL_Inicial ahora acepta el nivel de precio del SL
+            writer.writerow([timestamp, trade_type, f"{entry_price:.4f}", f"{entry_rsi:.2f}", f"{entry_atr:.4f}", f"{initial_sl:.4f}", f"{exit_price:.4f}", reason, f"{pnl:.4f}"])
+    except Exception as e:
+        logging.error(f"Error log trades: {e}")
+
+def send_whatsapp_message(message):
+    try:
+        msg = twilio_client.messages.create(body=message, from_=whatsapp_from, to=whatsapp_to)
+        print("Notificación enviada a WhatsApp, SID:", msg.sid)
+    except Exception as e:
+        logging.error("Error al enviar notificación WhatsApp: %s", str(e))
+
+def init_exchange():
+    is_testnet = True
+    host_url = "https://api-testnet.gateapi.io/api/v4"
+    logging.info("[INIT] Conectando al Testnet de Gate.io FUTURES...")
+    configuration = gate_api.Configuration(key=API_KEY, secret=API_SECRET, host=host_url)
+    api_client = gate_api.ApiClient(configuration)
+    futures_api = gate_api.FuturesApi(api_client)
+    try:
+        futures_api.list_futures_accounts(settle=SETTLE)
+        logging.info("[OK] Credenciales de API válidas.")
+        try:
+            futures_api.update_position_leverage(settle=SETTLE, contract=SYMBOL, leverage=LEVERAGE)
+            logging.info(f"[INIT] Apalancamiento para {SYMBOL} ajustado a {LEVERAGE}x")
+        except GateApiException as ex:
+            logging.warning(f"[WARN] No se pudo ajustar leverage: {ex.message}")
+        return futures_api
+    except GateApiException as ex:
+        logging.critical(f"[ERROR FATAL] Fallo conexión API: {ex.message}")
+        sys.exit(1)
+
+def cancel_all_open_orders(client):
+    try:
+        logging.info(f"🧹 Limpiando órdenes pendientes para {SYMBOL}...")
+        client.cancel_futures_orders(SETTLE, contract=SYMBOL)
+        logging.info("✅ Todas las órdenes pendientes han sido canceladas.")
+    except Exception as e:
+        logging.error(f"Error intentando limpiar órdenes: {e}")
+
+def get_contract_details(client):
+    try:
+        contract = client.get_futures_contract(settle=SETTLE, contract=SYMBOL)
+        return {"quanto_multiplier": float(contract.quanto_multiplier)}
+    except Exception as ex:
+        logging.critical(f"Error contrato: {ex}")
+        return None
+
+def place_market_order(client, size):
+    try:
+        order = gate_api.FuturesOrder(contract=SYMBOL, size=int(size), price='0', tif='ioc')
+        created_order = client.create_futures_order(SETTLE, futures_order=order)
+        time.sleep(1)
+        filled_order = client.get_futures_order(SETTLE, created_order.id)
+        if filled_order.status == 'finished' and filled_order.fill_price:
+            logging.info(f"✅ Orden ejecutada: ${float(filled_order.fill_price):,.4f}")
+            return float(filled_order.fill_price)
+        else:
+            logging.error(f"Orden no ejecutada correctamente: {filled_order.status}")
+            return None
+    except GateApiException as ex:
+        logging.error(f"Error API orden: {ex.message}")
+        return None
+
+def get_current_position(client):
+    try:
+        position = client.get_position(SETTLE, SYMBOL)
+        return {"size": int(position.size), "entry_price": float(position.entry_price)}
+    except Exception:
+        return {"size": 0, "entry_price": 0.0}
+
+def fetch_data_and_indicators(client):
+    try:
+        bars = client.list_futures_candlesticks(settle=SETTLE, contract=SYMBOL, interval=TIMEFRAME, limit=200)
+        df = pd.DataFrame([{"timestamp": int(bar.t), "close": float(bar.c), "high": float(bar.h), "low": float(bar.l)} for bar in bars])
+        df["dt"] = pd.to_datetime(df["timestamp"], unit='s')
+        df = df.sort_values(by="timestamp").reset_index(drop=True)
+        df[f'ATR_14'] = df.ta.atr(length=14)
+        df[f'RSI_{RSI_PERIOD}'] = df.ta.rsi(length=RSI_PERIOD)
+        return df
+    except Exception as e:
+        logging.error(f"Error indicadores: {e}")
+        return None
+
+def get_lstm_prediction(df_datos, modelo, scaler, n_lags):
+    df_clean = df_datos.iloc[:-1].dropna(subset=['close'])
+    if len(df_clean) < n_lags: return None
+    try:
+        ultimos_datos = df_clean['close'].tail(n_lags).values.reshape(-1, 1)
+        datos_normalizados = scaler.transform(ultimos_datos)
+        datos_para_predecir = np.reshape(datos_normalizados, (1, n_lags, 1))
+        prediccion = scaler.inverse_transform(modelo.predict(datos_para_predecir, verbose=0))
+        return prediccion[0][0]
+    except Exception: return None
+
+# ======================================================================
+# 3) ENTRENAMIENTO
+# ======================================================================
+def fetch_training_data(client, limit=2000):
+    logging.info(f"Descargando {limit} velas para entrenamiento...")
+    try:
+        bars = client.list_futures_candlesticks(settle=SETTLE, contract=SYMBOL, interval=TIMEFRAME, limit=limit)
+        df = pd.DataFrame([{"timestamp": int(bar.t), "close": float(bar.c)} for bar in bars])
+        return df.sort_values(by="timestamp").reset_index(drop=True)['close'].values.reshape(-1, 1)
+    except Exception as e:
+        logging.error(f"Error datos entrenamiento: {e}")
+        return None
+
+def train_and_save_model(client, scaler_path, model_path):
+    logging.warning(f"Entrenando modelo LSTM para {SYMBOL} ({TIMEFRAME})...")
+    send_whatsapp_message(f"🤖 Entrenando modelo LSTM para {SYMBOL} ({TIMEFRAME})...")
+    data = fetch_training_data(client, limit=TRAIN_DATA_LIMIT)
+    if data is None or len(data) < N_LAGS + 50: sys.exit(1)
+    
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled_data = scaler.fit_transform(data)
+    joblib.dump(scaler, scaler_path)
+    
+    X_train, y_train = [], []
+    for i in range(N_LAGS, len(scaled_data)):
+        X_train.append(scaled_data[i-N_LAGS:i, 0])
+        y_train.append(scaled_data[i, 0])
+    X_train, y_train = np.array(X_train), np.array(y_train)
+    X_train = np.reshape(X_train, (X_train.shape[0], X_train.shape[1], 1))
+    
+    model = Sequential()
+    model.add(LSTM(units=50, return_sequences=True, input_shape=(N_LAGS, 1)))
+    model.add(Dropout(0.2))
+    model.add(LSTM(units=50, return_sequences=False))
+    model.add(Dropout(0.2))
+    model.add(Dense(units=25))
+    model.add(Dense(units=1))
+    model.compile(optimizer='adam', loss='mean_squared_error')
+    model.fit(X_train, y_train, epochs=TRAIN_EPOCHS, batch_size=TRAIN_BATCH_SIZE, verbose=1)
+    model.save(model_path)
+    send_whatsapp_message(f"✅ Modelo LSTM ({SYMBOL} {TIMEFRAME}) guardado.")
+
+# ======================================================================
+# 4) MAIN (BTC 1m) - RSI 50 TARGET & ATR SL & TRAILING STOP
+# ======================================================================
+
+def main():
+    client = init_exchange()
+    setup_log_files()
+    cancel_all_open_orders(client)
+
+    if not os.path.exists(MODEL_FILE) or not os.path.exists(SCALER_FILE):
+        train_and_save_model(client, SCALER_FILE, MODEL_FILE)
+
+    try:
+        modelo_lstm = tf.keras.models.load_model(MODEL_FILE)
+        scaler_lstm = joblib.load(SCALER_FILE)
+        logging.info("[OK] Modelo y Scaler cargados.")
+    except Exception as e:
+        logging.critical(f"Error cargando modelo: {e}")
+        sys.exit(1)
+
+    # Variables de Estado (ACTUALIZADO)
+    position_type = None
+    position_size_contracts = 0
+    entry_price = 0.0
+    entry_sl_level = 0.0 # Nivel de precio del Stop Loss
+    
+    entry_rsi = 0.0
+    entry_atr = 0.0
+    last_known_rsi = None
+    trailing_activated = False # ESTADO DEL TRAILING STOP
+    
+    contract_details = get_contract_details(client)
+    if not contract_details: sys.exit(1)
+    contract_multiplier = contract_details["quanto_multiplier"]
+
+    logging.info(f"✅ Bot Iniciado: {SYMBOL} ({TIMEFRAME}) [MODO: RSI 50 SALIDA + ATR SL + Trailing Stop]")
+    send_whatsapp_message(f"✅ Bot Iniciado: {SYMBOL} ({TIMEFRAME}) [MODO: RSI 50 SALIDA + ATR SL + Trailing Stop]")
+
+    while True:
+        try:
+            current_time = time.time()
+            current_timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+            # 1. Sincronización
+            actual_position = get_current_position(client)
+            actual_position_size = actual_position.get('size', 0)
+            
+            # Sincronización de posición cerrada externamente (reseteo de variables de estado)
+            if actual_position_size == 0 and position_type is not None:
+                logging.warning("¡Desincronización! Posición cerrada externamente.")
+                log_trade(current_timestamp_str, position_type, entry_price, entry_rsi, entry_atr, entry_sl_level, 0.0, "Desync/Manual", 0.0)
+                position_type, position_size_contracts, entry_sl_level = None, 0, 0.0
+                entry_price = 0.0
+                trailing_activated = False
+            
+            # 2. Obtener Datos
+            df = fetch_data_and_indicators(client)
+            if df is None or len(df) < max(VOL_PERIOD, N_LAGS, RSI_PERIOD):
+                logging.warning("Datos insuficientes, reintentando...")
+                time.sleep(10)
+                continue
+
+            # 3. Calcular Volatilidad
+            df['low_pct_change'] = df['low'].pct_change() * 100
+            df['high_pct_change'] = df['high'].pct_change() * 100
+            df['vol_low_pct'] = df['low_pct_change'].rolling(VOL_PERIOD).std()
+            df['vol_high_pct'] = df['high_pct_change'].rolling(VOL_PERIOD).std()
+            
+            df_clean = df.dropna().reset_index(drop=True)
+            if len(df_clean) < 2:
+                 time.sleep(10)
+                 continue
+
+            # --- REFERENCIAS DE VELA ---
+            signal_row = df_clean.iloc[-2] # Vela Cerrada (Entradas)
+            current_row = df_clean.iloc[-1] # Vela Actual (Salidas/Cierre)
+
+            current_price = current_row["close"]
+            
+            atr_signal = signal_row[f'ATR_14']
+            rsi_signal = signal_row[f'RSI_{RSI_PERIOD}']
+            rsi_live = current_row[f'RSI_{RSI_PERIOD}'] # RSI en la vela actual para salidas
+
+            valor_volatilidad_baja = signal_row['vol_low_pct']
+            valor_volatilidad_alta = signal_row['vol_high_pct']
+            permitir_compra = (valor_volatilidad_baja <= VOL_LOW_MAX)
+            permitir_venta = (valor_volatilidad_alta <= VOL_HIGH_MAX)
+
+            # Warm-up y Sincronización RSI
+            if last_known_rsi is None:
+                logging.info(f"🔥 Calibrando RSI con vela cerrada ({rsi_signal:.2f})...")
+                last_known_rsi = rsi_signal
+                sleep_time = 60 - (time.time() % 60)
+                time.sleep(sleep_time + 2)
+                continue
+
+            previous_rsi_signal = last_known_rsi
+
+            # --- 4A. GESTIÓN DEL TRAILING STOP (NUEVO) ---
+            if position_type and position_type in ('LONG', 'SHORT'):
+                price_change_pct = (current_price - entry_price) / entry_price
+                sl_buffer = entry_atr * ATR_SL_MULTIPLIER
+                
+                if position_type == 'LONG':
+                    current_pnl_pct = price_change_pct
+                    
+                    # 1. Activación del Trailing Stop
+                    if current_pnl_pct >= TRAILING_SL_START_PERCENT and not trailing_activated:
+                        trailing_activated = True
+                        logging.info(f"🟢 Trailing Stop ACTIVADO. Ganancia > {TRAILING_SL_START_PERCENT * 100:.2f}%.")
+                        
+                    # 2. Movimiento del Trailing Stop
+                    if trailing_activated:
+                        new_sl = current_price - sl_buffer
+                        # Solo movemos el SL si el nuevo nivel es MÁS ALTO (protegiendo más ganancia)
+                        if new_sl > entry_sl_level:
+                            entry_sl_level = new_sl
+                            logging.info(f"⬆️ Trailing SL movido a: {entry_sl_level:,.4f}")
+
+                elif position_type == 'SHORT':
+                    current_pnl_pct = -price_change_pct # PNL es inverso para SHORT
+                    
+                    # 1. Activación del Trailing Stop
+                    if current_pnl_pct >= TRAILING_SL_START_PERCENT and not trailing_activated:
+                        trailing_activated = True
+                        logging.info(f"🟣 Trailing Stop ACTIVADO. Ganancia > {TRAILING_SL_START_PERCENT * 100:.2f}%.")
+                        
+                    # 2. Movimiento del Trailing Stop
+                    if trailing_activated:
+                        new_sl = current_price + sl_buffer
+                        # Solo movemos el SL si el nuevo nivel es MÁS BAJO (protegiendo más ganancia)
+                        if new_sl < entry_sl_level:
+                            entry_sl_level = new_sl
+                            logging.info(f"⬇️ Trailing SL movido a: {entry_sl_level:,.4f}")
+
+
+            # --- 4B. VERIFICACIÓN DE SALIDA (SL/TP) ---
+            if position_type == 'LONG':
+                # Stop Loss ATR (Ahora incluye Trailing SL)
+                if current_price <= entry_sl_level:
+                    reason = "SL ATR/Trailing"
+                    logging.critical(f"🛑 STOP LOSS LONG activado! Precio: {current_price:,.2f} vs SL: {entry_sl_level:,.2f}")
+                    fill_close = place_market_order(client, -position_size_contracts)
+                    if fill_close:
+                        pnl = fill_close - entry_price
+                        log_trade(current_timestamp_str, position_type, entry_price, entry_rsi, entry_atr, entry_sl_level, fill_close, reason, pnl)
+                        send_whatsapp_message(f"🛑 SL LONG ({reason}). PNL: {pnl:,.2f}. Salida @ {fill_close:,.2f}")
+                        position_type, position_size_contracts, entry_sl_level = None, 0, 0.0
+                        entry_price = 0.0
+                        trailing_activated = False
+                        last_known_rsi = rsi_signal
+                        continue
+                        
+                # Take Profit RSI 50
+                elif rsi_live >= RSI_EXIT_TARGET:
+                    logging.info(f"🎯 RSI tocó 50 ({rsi_live:.2f}). Cerrando LONG.")
+                    fill_close = place_market_order(client, -position_size_contracts)
+                    if fill_close:
+                        pnl = fill_close - entry_price
+                        log_trade(current_timestamp_str, position_type, entry_price, entry_rsi, entry_atr, entry_sl_level, fill_close, "RSI 50 Target", pnl)
+                        send_whatsapp_message(f"🎯 SALIDA RSI 50. PNL: {pnl:,.2f}")
+                        position_type, position_size_contracts, entry_sl_level = None, 0, 0.0
+                        entry_price = 0.0
+                        trailing_activated = False
+                        last_known_rsi = rsi_signal
+                        continue
+
+            elif position_type == 'SHORT':
+                # Stop Loss ATR (Ahora incluye Trailing SL)
+                if current_price >= entry_sl_level:
+                    reason = "SL ATR/Trailing"
+                    logging.critical(f"🛑 STOP LOSS SHORT activado! Precio: {current_price:,.2f} vs SL: {entry_sl_level:,.2f}")
+                    fill_close = place_market_order(client, -position_size_contracts)
+                    if fill_close:
+                        pnl = entry_price - fill_close
+                        log_trade(current_timestamp_str, position_type, entry_price, entry_rsi, entry_atr, entry_sl_level, fill_close, reason, pnl)
+                        send_whatsapp_message(f"🛑 SL SHORT ({reason}). PNL: {pnl:,.2f}. Salida @ {fill_close:,.2f}")
+                        position_type, position_size_contracts, entry_sl_level = None, 0, 0.0
+                        entry_price = 0.0
+                        trailing_activated = False
+                        last_known_rsi = rsi_signal
+                        continue
+
+                # Take Profit RSI 50
+                elif rsi_live <= RSI_EXIT_TARGET:
+                    logging.info(f"🎯 RSI tocó 50 ({rsi_live:.2f}). Cerrando SHORT.")
+                    fill_close = place_market_order(client, -position_size_contracts)
+                    if fill_close:
+                        pnl = entry_price - fill_close
+                        log_trade(current_timestamp_str, position_type, entry_price, entry_rsi, entry_atr, entry_sl_level, fill_close, "RSI 50 Target", pnl)
+                        send_whatsapp_message(f"🎯 SALIDA RSI 50. PNL: {pnl:,.2f}")
+                        position_type, position_size_contracts, entry_sl_level = None, 0, 0.0
+                        entry_price = 0.0
+                        trailing_activated = False
+                        last_known_rsi = rsi_signal
+                        continue
+
+            # 5. Predicción LSTM
+            prediccion_t_mas_1 = get_lstm_prediction(df_clean, modelo_lstm, scaler_lstm, N_LAGS)
+            if prediccion_t_mas_1 is None:
+                logging.warning("Fallo predicción LSTM.")
+                last_known_rsi = rsi_signal
+                time.sleep(10)
+                continue
+
+            log_prediction(current_timestamp_str, current_price, prediccion_t_mas_1, rsi_signal, atr_signal)
+
+            # 6. Mostrar Estado
+            print("\n" + "="*60)
+            print(f"[{current_timestamp_str}] BTC 1m | Estado: ACTIVO")
+            print(f"Pos: {position_type or 'NINGUNA'} | $ {current_price:,.2f} | RSI(Live): {rsi_live:.2f} | RSI(Close): {rsi_signal:.2f}")
+            print(f"Volatilidad (Lows): {valor_volatilidad_baja:.4f}% | (Highs): {valor_volatilidad_alta:.4f}%")
+            if position_type:
+                print(f"Entrada: ${entry_price:,.2f} | SL: ${entry_sl_level:,.2f} (Trailing: {trailing_activated}) | Meta: RSI 50")
+
+            # 7. ENTRADA (Usamos signal_row)
+            final_qty = 0.0
+            trigger = False
+            new_pos = None
+
+            # Cruce Alcista (Usando RSI Cerrado)
+            if (previous_rsi_signal < RSI_BUY_LEVEL and rsi_signal > RSI_BUY_LEVEL) and position_type != 'LONG':
+                logging.info("SEÑAL RSI ALCISTA detectada.")
+                if not permitir_compra: logging.warning("Bloqueado por Volatilidad Baja.")
+                else:
+                    trigger, new_pos = True, 'LONG'
+                    if prediccion_t_mas_1 > current_price * (1 + LSTM_CONFIRMATION_THRESHOLD):
+                        final_qty = BASE_QTY * MODIFIER_HIGH_CONFIDENCE
+                    else:
+                        final_qty = BASE_QTY * MODIFIER_LOW_CONFIDENCE
+
+            # Cruce Bajista (Usando RSI Cerrado)
+            elif (previous_rsi_signal > RSI_SELL_LEVEL and rsi_signal < RSI_SELL_LEVEL) and position_type != 'SHORT':
+                logging.info("SEÑAL RSI BAJISTA detectada.")
+                if not permitir_venta: logging.warning("Bloqueado por Volatilidad Alta.")
+                else:
+                    trigger, new_pos = True, 'SHORT'
+                    if prediccion_t_mas_1 < current_price * (1 - LSTM_CONFIRMATION_THRESHOLD):
+                        final_qty = BASE_QTY * MODIFIER_HIGH_CONFIDENCE
+                    else:
+                        final_qty = BASE_QTY * MODIFIER_LOW_CONFIDENCE
+            
+            if trigger:
+                qty_contracts = round(final_qty / contract_multiplier)
+                
+                if qty_contracts > 0:
+                    # Reversión (Si el precio cruza extremo a extremo sin tocar 50, lo cual es raro pero posible)
+                    if position_type:
+                        logging.info(f"Reversión: Cerrando {position_type}...")
+                        fill_close = place_market_order(client, -position_size_contracts)
+                        if fill_close:
+                            pnl = (fill_close - entry_price) if position_type == 'LONG' else (entry_price - fill_close)
+                            # Usamos el último entry_sl_level conocido para el log del cierre
+                            log_trade(current_timestamp_str, position_type, entry_price, entry_rsi, entry_atr, entry_sl_level, fill_close, "Reversión", pnl)
+                            send_whatsapp_message(f"Reversión ejecutada. PNL: {pnl:,.2f}")
+                        else:
+                            logging.error("Fallo al cerrar reversión.")
+                            last_known_rsi = rsi_signal
+                            continue
+
+                    # Apertura (ACTUALIZADO)
+                    size = qty_contracts if new_pos == 'LONG' else -qty_contracts
+                    fill_open = place_market_order(client, size)
+                    if fill_open:
+                        # Calcular el Stop Loss basado en ATR
+                        sl_diff = atr_signal * ATR_SL_MULTIPLIER
+                        
+                        if new_pos == 'LONG':
+                            new_sl = fill_open - sl_diff
+                        else: # SHORT
+                            new_sl = fill_open + sl_diff
+                        
+                        position_type = new_pos
+                        position_size_contracts = size
+                        entry_price = fill_open
+                        entry_sl_level = new_sl # ALMACENAR NIVEL SL
+                        entry_rsi, entry_atr = rsi_signal, atr_signal
+                        trailing_activated = False # REINICIAR AL ENTRAR
+                        
+                        logging.info(f"SL Inicial establecido: {entry_sl_level:,.4f} (${sl_diff:,.4f} de búfer)")
+                        send_whatsapp_message(f"{'🟢' if position_type=='LONG' else '🟣'} {SYMBOL} {position_type} @ ${entry_price:,.2f} | SL: ${entry_sl_level:,.2f}")
+
+            # Actualizar memoria y esperar
+            last_known_rsi = rsi_signal
+            sleep_time = 60 - (time.time() % 60)
+            logging.info(f"Esperando {sleep_time:.1f}s (+2s buffer)...")
+            time.sleep(sleep_time + 2)
+
+        except KeyboardInterrupt:
+            logging.info("Bot detenido.")
+            send_whatsapp_message("🛑 Bot detenido manualmente.")
+            break
+        except Exception as e:
+            logging.error(f"Error en ciclo principal: {e}")
+            time.sleep(10)
+
+if __name__ == "__main__":
+    main()
